@@ -1,0 +1,59 @@
+name: Oxygen
+options:
+  bundleIdPrefix: com.emanuelefalli
+  deploymentTarget:
+    iOS: "17.0"
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+packages:
+  OpenCircuitKit:
+    path: ../OpenCircuitKit
+targets:
+  Oxygen:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: OpenCircuitKit
+        product: OpenCircuitKit
+      - package: OpenCircuitKit
+        product: ZeppKit
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: Oxygen
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        NSBluetoothAlwaysUsageDescription: "Oxygen connects to your Helio Strap to sync your health data."
+        UIBackgroundModes: [bluetooth-central]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.emanuelefalli.oxygen
+  OxygenTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+      # Compiled from source, as upstream's test target does, so ZeppKit resolves against the app's single copy.
+      - path: ../OpenCircuitKit/Sources/ZeppKitTesting/FakeZeppDevice.swift
+    dependencies:
+      - target: Oxygen
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.emanuelefalli.oxygen.tests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Oxygen:
+    build:
+      targets:
+        Oxygen: all
+        OxygenTests: [test]
+    test:
+      targets: [OxygenTests]
