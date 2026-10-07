@@ -33,13 +33,19 @@
   - The one exception: the test target compiles `ios/OpenCircuitKit/Sources/ZeppKitTesting/FakeZeppDevice.swift`, which is upstream's own pattern.
 - **Dependencies:** no third-party dependencies.
 - **Adaptation headers:** a file adapted from upstream app-target code starts with exactly one comment line: `// Adapted from <upstream path> at upstream <40-character commit>.`
-- **Timing:** scan timeout 15 s, fetch timeout 30 s without progress, retry delay 10 s, one retry per sync.
+- **Timing:**
+  - Scan timeout 15 s.
+  - Auth timeout 10 s; it ends in `strapBusy`.
+  - Each preparation step 5 s; the step is skipped.
+  - Fetch timeout 30 s without progress.
+  - Retry delay 10 s, one retry per sync.
 - **Acks:** keep-on-device (`03 09`) only, never `03 01`. Never pass `--allow-delete` or `--allow-write` to HelioVerify.
 - **Fetch order:** the 13 types in ascending code order (spec section 12.1). `0x2c` is never fetched.
-- **Watermark:**
-  - It is the newest decoded record timestamp among committed rounds, and it never moves backward.
-  - A fetch starts at the watermark, inclusive.
-  - With no watermark, a fetch starts at now − 604 800 s (7 days).
+- **Watermark (upstream rule):**
+  - After a committed round, the watermark is the round's `nextSince` (last record + 1 minute). It never passes now (floored to the minute) and never moves backward.
+  - A fetch starts at the watermark floored to the minute, but never more than `HelioFetchPlan.maxLookback` (30 days) back.
+  - With no watermark, or one more than `HelioFetchPlan.futureTolerance` (5 min) ahead of now, a fetch starts at now − `HelioFetchPlan.firstSyncLookback` (7 days).
+  - Reuse those upstream constants and `HelioFetchPlan.floorToMinute`. Do not copy their values.
 - **Time:**
   - Timestamps are stored as `Date`.
   - CSV files use ISO-8601 UTC without fractional seconds (`2026-10-07T06:42:00Z`).
@@ -94,7 +100,7 @@ These are failure modes the spec implies but no single feature test exercises. E
 | `ios/Oxygen/Sources/Sync/SyncCoordinator.swift` | Pure reducer and `initialState` |
 | `ios/Oxygen/Sources/Sync/StrapSession.swift` | Pure ZeppKit session state machine |
 | `ios/Oxygen/Sources/Sync/FetchedRound.swift` | One history round as received from the session |
-| `ios/Oxygen/Sources/Sync/StrapCharacteristic.swift` | GATT characteristic identities used by the session |
+| `ios/Oxygen/Sources/Sync/StrapCharacteristic.swift` | `typealias StrapCharacteristic = ZeppCharacteristic` |
 | `ios/Oxygen/Sources/Sync/StrapConnecting.swift` | Connection protocol and `StrapConnectionEvent` |
 | `ios/Oxygen/Sources/Sync/StrapConnection.swift` | CoreBluetooth implementation |
 | `ios/Oxygen/Sources/Sync/SyncTimerScheduling.swift` | Timer protocol and its `Task`-based implementation |
@@ -111,7 +117,7 @@ These are failure modes the spec implies but no single feature test exercises. E
 | `ios/Oxygen/Sources/Store/RawStore.swift` | `RawStoring` protocol and its SwiftData implementation |
 | `ios/Oxygen/Sources/Decode/StrapRecordDecoder.swift` | Decodes a round with ZeppKit's parser |
 | `ios/Oxygen/Sources/Decode/RecordDeduplicator.swift` | Unique by (type, timestamp); the later receipt wins |
-| `ios/Oxygen/Sources/Decode/WatermarkRule.swift` | Newest timestamp and fetch start |
+| `ios/Oxygen/Sources/Decode/WatermarkRule.swift` | Fetch start and watermark advance, built on upstream's `HelioFetchPlan` constants |
 | `ios/Oxygen/Sources/ResignGuard/ProvisioningProfileReader.swift` | Reads `ExpirationDate` |
 | `ios/Oxygen/Sources/ResignGuard/ResignStatus.swift` | Status from the expiry date and now |
 | `ios/Oxygen/Sources/ResignGuard/ResignReminder.swift` | Local notification 24 h before expiry |
@@ -195,7 +201,13 @@ Expected: `ls` lists one file in each folder, and `git push` ends with `main -> 
 
 - [ ] **Step 5: Extract the auth key**
 
-Follow `docs/HELIO_KEY_EXTRACTION.md`, method 1 (the Zepp website and the browser console). Save only the 32-character key:
+The key is saved in a hidden folder in your home folder, `~/.oxygen/`, outside the repository so git can never commit it.
+
+1. In a browser on the MacBook, sign in at `https://watchface.zepp.com/` with your Zepp account. The strap must already be paired and synced in the Zepp app.
+2. Open the developer console. In Safari, first turn on Settings → Advanced → "Show features for web developers", then press `Cmd+Option+C`. In Chrome, press `Cmd+Option+J`.
+3. Copy the snippet from the "Zepp watchface website" section of `https://gadgetbridge.org/basics/pairing/huami-xiaomi-server/`. Paste it into the console and press Enter. If Chrome asks, type `allow pasting` first.
+4. In the output, find the Helio Strap entry. Inside its `additionalInfo`, copy only the value after `"auth_key":`: the 32 characters between the quotes, without the quotes.
+5. In Terminal, while the key is still on the clipboard:
 
 ```bash
 mkdir -p ~/.oxygen && chmod 700 ~/.oxygen
@@ -203,7 +215,9 @@ pbpaste > ~/.oxygen/helio-auth-key.txt && chmod 600 ~/.oxygen/helio-auth-key.txt
 grep -Eic '^(0x)?[0-9a-f]{32}$' ~/.oxygen/helio-auth-key.txt
 ```
 
-Expected: `1`.
+Expected: `1`. If you get `0`, the clipboard held extra characters. Run `open -e ~/.oxygen/helio-auth-key.txt`, leave only the 32 characters on one line, save, and run the `grep` line again.
+
+If the device list in step 4 is empty, sync the strap in Zepp and run the snippet again.
 
 - [ ] **Step 6: Release the strap from Zepp**
 
@@ -354,7 +368,7 @@ schemes:
       targets: [OxygenTests]
 ```
 
-Add the package products that API map row 13 lists for the upstream test bundle to `OxygenTests.dependencies`, as `- package: OpenCircuitKit` with `product: <name>` entries.
+API map row 13 confirms that the test bundle needs no extra package products. It compiles `FakeZeppDevice.swift` from source, so ZeppKit resolves against the app's single copy.
 
 - [ ] **Step 2: Write `ios/Oxygen/.gitignore`**
 
@@ -475,13 +489,14 @@ enum SyncEvent: Equatable, Sendable {
     case syncRequested, authKeyEntered, authKeyMissing
     case bluetoothPoweredOn, bluetoothPoweredOff, bluetoothUnauthorized
     case strapDiscovered, strapBusyDetected, scanTimedOut, connected, connectionFailed
-    case authSucceeded, authRejected, sessionPrepared
+    case authSucceeded, authRejected, authTimedOut
+    case preparationStepStarted, preparationStepTimedOut, sessionPrepared
     case fetchProgressed(StrapFetchType), fetchCompleted(StrapFetchType), fetchTimedOut(StrapFetchType)
     case linkLost, persistSucceeded(StrapFetchType), persistFailed(StrapFetchType), retryTimerFired
 }
-enum SyncTimer: Equatable, Hashable, Sendable { case scan, fetch, retry }
+enum SyncTimer: Equatable, Hashable, Sendable { case scan, session, fetch, retry }
 enum SyncEffect: Equatable, Sendable {
-    case startScan, stopScan, connect, disconnect, authenticate, prepareSession
+    case startScan, stopScan, connect, disconnect, authenticate, prepareSession, skipPreparationStep
     case fetch(StrapFetchType), persist(StrapFetchType)
     case armTimer(SyncTimer, seconds: Int), cancelTimer(SyncTimer)
     case markKeyRejected, recordSyncCompleted
@@ -490,6 +505,8 @@ struct SyncTransition: Equatable, Sendable { let nextState: SyncState; let effec
 
 enum SyncCoordinator {
     static let scanTimeoutSeconds = 15
+    static let authenticationTimeoutSeconds = 10
+    static let preparationStepTimeoutSeconds = 5
     static let fetchTimeoutSeconds = 30
     static let retryDelaySeconds = 10
     static func initialState(hasKey: Bool, keyRejected: Bool) -> SyncState
@@ -552,8 +569,9 @@ func step(_ step: SyncStep, retryUsed: Bool = false) -> SyncState { state(.activ
 func expectedTeardown(_ step: SyncStep) -> [SyncEffect] {
     switch step {
     case .scanning: return [.cancelTimer(.scan), .stopScan]
+    case .authenticating, .preparing: return [.cancelTimer(.session), .disconnect]
     case .fetching: return [.cancelTimer(.fetch), .disconnect]
-    case .connecting, .authenticating, .preparing, .persisting: return [.disconnect]
+    case .connecting, .persisting: return [.disconnect]
     }
 }
 let connectedSteps: [SyncStep] = [.connecting, .authenticating, .preparing, .fetching(.temperature), .persisting(.temperature)]
@@ -568,17 +586,19 @@ Listed rows, as `(name, state, event, next state, effects)`:
 | idleBluetoothPoweredOffFails | idle | bluetoothPoweredOff | failed(.bluetoothOff) | [] |
 | idleBluetoothUnauthorizedFails | idle | bluetoothUnauthorized | failed(.bluetoothUnauthorized) | [] |
 | scanningStrapDiscoveredConnects | step(.scanning) | strapDiscovered | step(.connecting) | [.cancelTimer(.scan), .stopScan, .connect] |
-| scanningStrapBusyFails | step(.scanning) | strapBusyDetected | failed(.strapBusy) | [.cancelTimer(.scan), .stopScan] |
 | scanningTimeoutFailsNotFound | step(.scanning) | scanTimedOut | failed(.strapNotFound) | [.stopScan] |
 | scanningSyncRequestedIsIgnored | step(.scanning) | syncRequested | step(.scanning) | [] |
-| connectingConnectedAuthenticates | step(.connecting) | connected | step(.authenticating) | [.authenticate] |
+| connectingConnectedAuthenticates | step(.connecting) | connected | step(.authenticating) | [.authenticate, .armTimer(.session, seconds: 10)] |
 | connectingFailureWaitsForRetry | step(.connecting) | connectionFailed | state(.waitingForRetry(.linkLost(during: .connecting)), retryUsed: true) | [.disconnect, .armTimer(.retry, seconds: 10)] |
 | connectingFailureAfterRetryFails | step(.connecting, retryUsed: true) | connectionFailed | state(.failed(.linkLost(during: .connecting)), retryUsed: true) | [.disconnect] |
-| connectingStrapBusyFails | step(.connecting) | strapBusyDetected | failed(.strapBusy) | [.disconnect] |
-| authenticatingSuccessPrepares | step(.authenticating) | authSucceeded | step(.preparing) | [.prepareSession] |
-| authenticatingRejectedMarksKey | step(.authenticating) | authRejected | failed(.keyRejected) | [.markKeyRejected, .disconnect] |
-| authenticatingKeyMissingFails | step(.authenticating) | authKeyMissing | failed(.keyMissing) | [.disconnect] |
-| preparingDoneFetchesActivity | step(.preparing) | sessionPrepared | step(.fetching(.activity)) | [.fetch(.activity), .armTimer(.fetch, seconds: 30)] |
+| authenticatingSuccessPrepares | step(.authenticating) | authSucceeded | step(.preparing) | [.cancelTimer(.session), .prepareSession] |
+| authenticatingRejectedMarksKey | step(.authenticating) | authRejected | failed(.keyRejected) | [.cancelTimer(.session), .markKeyRejected, .disconnect] |
+| authenticatingKeyMissingFails | step(.authenticating) | authKeyMissing | failed(.keyMissing) | [.cancelTimer(.session), .disconnect] |
+| authenticatingBusyFails | step(.authenticating) | strapBusyDetected | failed(.strapBusy) | [.cancelTimer(.session), .disconnect] |
+| authenticatingTimeoutFailsBusy | step(.authenticating) | authTimedOut | failed(.strapBusy) | [.disconnect] |
+| preparingStepStartedArmsTimer | step(.preparing) | preparationStepStarted | same | [.armTimer(.session, seconds: 5)] |
+| preparingStepTimeoutSkipsStep | step(.preparing) | preparationStepTimedOut | same | [.skipPreparationStep] |
+| preparingDoneFetchesActivity | step(.preparing) | sessionPrepared | step(.fetching(.activity)) | [.cancelTimer(.session), .fetch(.activity), .armTimer(.fetch, seconds: 30)] |
 | fetchingProgressRearmsTimer | step(.fetching(.temperature)) | fetchProgressed(.temperature) | same | [.armTimer(.fetch, seconds: 30)] |
 | fetchingCompletedPersists | step(.fetching(.temperature)) | fetchCompleted(.temperature) | step(.persisting(.temperature)) | [.cancelTimer(.fetch), .persist(.temperature)] |
 | fetchingTimeoutWaitsForRetry | step(.fetching(.temperature)) | fetchTimedOut(.temperature) | state(.waitingForRetry(.fetchTimeout(.temperature)), retryUsed: true) | [.cancelTimer(.fetch), .disconnect, .armTimer(.retry, seconds: 10)] |
@@ -814,12 +834,20 @@ struct StrapKeyStore: StrapKeyStoring {
 }
 ```
 
-Parse rules:
+Parse rule (API map row 1):
 
-1. Trim whitespace and newlines.
-2. Remove every space and colon.
-3. Strip one leading `0x` or `0X`.
-4. The result must be exactly 32 characters of `[0-9a-fA-F]`. Otherwise return `nil`.
+- `HelioKeyText.normalized(text)` gives 32 lowercase hex digits, or nil.
+- `ZeppHex.bytes(_:)` turns them into the 16 `bytes`.
+- `ZeppAuthKey(bytes:)` builds `zeppAuthKey`. `ZeppAuthKey` keeps its bytes internal, so Oxygen holds its own copy for the Keychain.
+
+`HelioKeyText.normalized` does this:
+
+1. Trim whitespace.
+2. Strip one leading `0x` or `0X`.
+3. Remove whitespace and colons anywhere.
+4. Require exactly 32 ASCII hex digits.
+
+Add `var zeppAuthKey: ZeppAuthKey { get }` for `StrapSession`.
 
 Keychain details:
 
@@ -919,7 +947,10 @@ git commit -m "feat(oxygen): parse strap auth key and store it in the Keychain"
 - Produces:
 
 ```swift
-struct FetchedRound: Equatable, Sendable { let fetchType: StrapFetchType; let roundStart: Date; let payload: Data; let receivedAt: Date }
+struct FetchedRound: Equatable, Sendable {
+    let fetchType: StrapFetchType; let roundStart: Date; let payload: Data; let receivedAt: Date
+    let nextSince: Date?                             // ZeppFetchRound.nextSince: last record + 1 minute; nil when empty
+}
 
 struct StoredRound: Equatable, Sendable {
     let fetchType: StrapFetchType; let roundStart: Date; let payload: Data
@@ -935,12 +966,12 @@ struct StoredRound: Equatable, Sendable {
 }
 @Model final class StrapFetchWatermark {
     @Attribute(.unique) var fetchTypeCode: Int
-    var newestRecordTimestamp: Date
+    var watermark: Date
 }
 
 @MainActor protocol RawStoring: AnyObject {
     func watermark(for type: StrapFetchType) throws -> Date?
-    func commit(rounds: [StoredRound], type: StrapFetchType, newestRecordTimestamp: Date?) throws
+    func commit(rounds: [StoredRound], type: StrapFetchType, watermark: Date?) throws
     func allRounds() throws -> [StoredRound]         // sorted by fetch type code, then roundStart, then receivedAt
 }
 @MainActor final class RawStore: RawStoring {
@@ -952,7 +983,7 @@ struct StoredRound: Equatable, Sendable {
 `commit` rules:
 
 - Insert every round whose `identity` is not stored yet. A round whose identity already exists is skipped, never replaced.
-- Set the watermark to `max(existing, newestRecordTimestamp)`. If `newestRecordTimestamp` is nil, leave it unchanged.
+- Set the watermark to `max(existing, watermark)`. If `watermark` is nil, leave it unchanged.
 - Everything above goes into one `ModelContext.save()`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -964,7 +995,7 @@ struct StoredRound: Equatable, Sendable {
 
     func makeStore() throws -> RawStore { RawStore(container: try RawStore.makeContainer(inMemory: true)) }
     func round(_ bytes: [UInt8], start: Date) -> StoredRound {
-        StoredRound(fetched: FetchedRound(fetchType: .activity, roundStart: start, payload: Data(bytes), receivedAt: t0))
+        StoredRound(fetched: FetchedRound(fetchType: .activity, roundStart: start, payload: Data(bytes), receivedAt: t0, nextSince: nil))
     }
 
     @Test func digestAndIdentity() {
@@ -974,22 +1005,22 @@ struct StoredRound: Equatable, Sendable {
     }
     @Test func commitStoresRoundsAndWatermark() throws {
         let store = try makeStore()
-        try store.commit(rounds: [round([0x01, 0x02, 0x03], start: t0), round([0x0a, 0x0b], start: t0)], type: .activity, newestRecordTimestamp: t1)
+        try store.commit(rounds: [round([0x01, 0x02, 0x03], start: t0), round([0x0a, 0x0b], start: t0)], type: .activity, watermark: t1)
         #expect(try store.allRounds().count == 2)
         #expect(try store.watermark(for: .activity) == t1)
         #expect(try store.watermark(for: .temperature) == nil)
     }
     @Test func committingSameRoundTwiceStoresOnce() throws {
         let store = try makeStore()
-        try store.commit(rounds: [round([0x01, 0x02, 0x03], start: t0)], type: .activity, newestRecordTimestamp: t0)
-        try store.commit(rounds: [round([0x01, 0x02, 0x03], start: t0)], type: .activity, newestRecordTimestamp: t0)
+        try store.commit(rounds: [round([0x01, 0x02, 0x03], start: t0)], type: .activity, watermark: t0)
+        try store.commit(rounds: [round([0x01, 0x02, 0x03], start: t0)], type: .activity, watermark: t0)
         #expect(try store.allRounds().count == 1)
     }
     @Test func watermarkNeverMovesBackward() throws {
         let store = try makeStore()
-        try store.commit(rounds: [], type: .activity, newestRecordTimestamp: t1)
-        try store.commit(rounds: [], type: .activity, newestRecordTimestamp: t0)
-        try store.commit(rounds: [], type: .activity, newestRecordTimestamp: nil)
+        try store.commit(rounds: [], type: .activity, watermark: t1)
+        try store.commit(rounds: [], type: .activity, watermark: t0)
+        try store.commit(rounds: [], type: .activity, watermark: nil)
         #expect(try store.watermark(for: .activity) == t1)
     }
 }
@@ -1047,9 +1078,8 @@ enum RecordDeduplicator {
     static func merge(_ records: [DecodedStrapRecord]) -> [DecodedStrapRecord]
 }
 enum WatermarkRule {
-    static let defaultLookbackSeconds: TimeInterval = 604_800
-    static func newestRecordTimestamp(in records: [DecodedStrapRecord]) -> Date?
     static func fetchStart(watermark: Date?, now: Date) -> Date
+    static func advanced(previous: Date?, nextSince: Date?, now: Date) -> Date?
 }
 ```
 
@@ -1059,11 +1089,33 @@ enum WatermarkRule {
   - `Date` as ISO-8601 UTC without fractional seconds.
   - `Bool` as `true` or `false`.
   - Enums by case name (`String(describing:)`).
+  - Byte arrays as lowercase hex without separators (`ZeppHex.string`).
+  - Sleep stages as `start/end/kind` triples joined by `;`. `start` and `end` are ISO-8601 UTC, and `kind` is the case name, e.g. `other(2)`.
   - `nil` as an empty string.
+- **Field names:** `fieldNames(for:)` returns the stored properties listed in API map row 8, in that order, without `time`.
+- **Type mapping:** `ZeppFetchType(rawValue: type.rawValue)`. The 13 codes are identical (API map row 7).
 - **`merge`:**
   - Records are unique by (fetchType, timestamp). On a clash, the record with the later `receivedAt` wins.
   - The output is sorted by fetch type code, then timestamp.
-- **`fetchStart`:** `watermark ?? now − 604 800 s`. Apply only the exceptions API map row 12 lists, each with its own test.
+- **`fetchStart`** (upstream's `HelioFetchPlan.plan` rule for one type, using its constants):
+
+  ```
+  first  = floorToMinute(now − firstSyncLookback)
+  oldest = floorToMinute(now − maxLookback)
+  latest = floorToMinute(now)
+  watermark nil, or watermark > now + futureTolerance   → first
+  otherwise                                              → min(max(floorToMinute(watermark), oldest), latest)
+  ```
+
+  Upstream's activity and sleep-session re-fetch tied to temperature is not copied (API map row 12).
+- **`advanced`** (upstream's `HelioFetchPlan.advancedCursor`, applied to a `nextSince`):
+
+  ```
+  nextSince nil     → previous
+  clamped           = min(nextSince, floorToMinute(now))
+  previous nil      → clamped
+  otherwise         → max(previous, clamped)
+  ```
 
 - [ ] **Step 1: Transcribe the fixtures**
 
@@ -1076,7 +1128,7 @@ enum WatermarkRule {
 - `expectedFirstTimestamp: Date`
 - `expectedFirstFields: [StrapRecordField]`
 
-Add `static let all: [DecoderFixture]` with one entry per fetch type, transcribed from API map row 9. Expected values are formatted with the field-formatting rules above.
+Add `static let all: [DecoderFixture]` with one entry per fetch type, transcribed from the "Decoder fixtures" table of the API map. The 6-byte heart-rate vector serves manual, resting and maximum heart rate. Rebuild the PAI and sleep-session payloads with the upstream builders the table points to, ported as private helpers in this file. Expected values are formatted with the field-formatting rules above.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -1085,7 +1137,8 @@ struct StrapRecordDecoderTests {
     @Test(arguments: DecoderFixture.all)
     func decodesUpstreamVector(_ fixture: DecoderFixture) throws {
         let round = StoredRound(fetched: FetchedRound(fetchType: fixture.fetchType, roundStart: fixture.roundStart,
-                                                      payload: Data(fixture.payload), receivedAt: fixture.roundStart))
+                                                      payload: Data(fixture.payload), receivedAt: fixture.roundStart,
+                                                      nextSince: nil))
         let records = try StrapRecordDecoder.decode(round)
         #expect(records.count == fixture.expectedRecordCount)
         #expect(records.first?.timestamp == fixture.expectedFirstTimestamp)
@@ -1119,16 +1172,31 @@ struct RecordDeduplicatorTests {
 }
 
 struct WatermarkRuleTests {
-    let now = Date(timeIntervalSince1970: 1_791_355_320)
+    let now = Date(timeIntervalSince1970: 1_791_355_320)                 // 2026-10-07T06:42:00Z, a whole minute
+    let sevenDaysBack = Date(timeIntervalSince1970: 1_790_750_520)
+
     @Test func defaultStartIsSevenDaysBack() {
-        #expect(WatermarkRule.fetchStart(watermark: nil, now: now) == Date(timeIntervalSince1970: 1_790_750_520))
+        #expect(WatermarkRule.fetchStart(watermark: nil, now: now) == sevenDaysBack)
     }
-    @Test func startsAtWatermarkInclusive() {
-        let watermark = Date(timeIntervalSince1970: 1_791_000_000)
-        #expect(WatermarkRule.fetchStart(watermark: watermark, now: now) == watermark)
+    @Test func startsAtWatermarkFlooredToMinute() {
+        #expect(WatermarkRule.fetchStart(watermark: Date(timeIntervalSince1970: 1_791_000_030), now: now)
+                == Date(timeIntervalSince1970: 1_791_000_000))
     }
-    @Test func newestOfEmptyIsNil() {
-        #expect(WatermarkRule.newestRecordTimestamp(in: []) == nil)
+    @Test func futureWatermarkBeyondToleranceCountsAsMissing() {
+        #expect(WatermarkRule.fetchStart(watermark: now.addingTimeInterval(300), now: now) == now)
+        #expect(WatermarkRule.fetchStart(watermark: now.addingTimeInterval(301), now: now) == sevenDaysBack)
+    }
+    @Test func neverMoreThanThirtyDaysBack() {
+        #expect(WatermarkRule.fetchStart(watermark: now.addingTimeInterval(-40 * 86_400), now: now)
+                == Date(timeIntervalSince1970: 1_788_763_320))
+    }
+    @Test func advanceFollowsUpstreamCursorRule() {
+        let earlier = Date(timeIntervalSince1970: 1_791_000_000)
+        #expect(WatermarkRule.advanced(previous: nil, nextSince: earlier, now: now) == earlier)
+        #expect(WatermarkRule.advanced(previous: nil, nextSince: now.addingTimeInterval(3600), now: now) == now)
+        #expect(WatermarkRule.advanced(previous: now, nextSince: earlier, now: now) == now)
+        #expect(WatermarkRule.advanced(previous: earlier, nextSince: nil, now: now) == earlier)
+        #expect(WatermarkRule.advanced(previous: nil, nextSince: nil, now: now) == nil)
     }
 }
 ```
@@ -1141,8 +1209,9 @@ Expected: compile failure.
 
 - [ ] **Step 4: Implement the three files**
 
-- `decode` switches on `round.fetchType` and calls the parser entry point from API map row 8.
-- It maps each parser property to a `StrapRecordField`, in the order `fieldNames(for:)` returns.
+- `decode` calls `ZeppRecordParser.parse(zeppType, data: [UInt8](round.payload), start: round.roundStart)`, then switches on the `ZeppRecordBatch` case.
+- It maps each record's stored properties to `StrapRecordField`s, in the order `fieldNames(for:)` returns. `timestamp` is the record's `time`.
+- `WatermarkRule` uses `HelioFetchPlan.firstSyncLookback`, `.maxLookback`, `.futureTolerance` and `.floorToMinute`. It never repeats their values.
 
 - [ ] **Step 5: Run the tests and confirm they pass**
 
@@ -1168,25 +1237,28 @@ git commit -m "feat(oxygen): decode strap rounds with ZeppKit, de-duplicate reco
 **Interfaces:**
 - Consumes:
   - `StrapAuthKey` (Task 6), `FetchedRound` (Task 7) and `DecoderFixture` (Task 8).
-  - API map rows 1–6 and 10.
-  - The upstream reference `ios/OpenCircuit/Helio/HelioSession.swift`.
+  - API map rows 1–7 and 10.
+  - The upstream reference `ios/OpenCircuit/Helio/HelioSession.swift`: setup at lines 700–760, messages at 810–875, fetch at 936–990.
 - Produces:
 
 ```swift
-struct StrapCharacteristic: Hashable, Sendable { let uuidString: String }
-// One static constant per characteristic in API map row 3, named after its ZeppGATT constant.
+typealias StrapCharacteristic = ZeppCharacteristic          // StrapCharacteristic.swift
 
 struct StrapDeviceSummary: Equatable, Sendable { let batteryPercent: Int?; let firmwareVersion: String? }
 
 enum StrapSessionInput: Equatable, Sendable {
-    case authenticate(key: StrapAuthKey, maximumWriteLength: Int)
+    case authenticate(key: StrapAuthKey, maximumWriteLength: Int, notifiable: Set<StrapCharacteristic>)
     case prepare(now: Date, timeZone: TimeZone)
-    case fetch(StrapFetchType, notBefore: Date, now: Date)
+    case skipPreparationStep
+    case fetch(StrapFetchType, since: Date, now: Date, timeZone: TimeZone)
     case notification(StrapCharacteristic, Data)
+    case notifyStateChanged(StrapCharacteristic, enabled: Bool)
 }
 enum StrapSessionOutput: Equatable, Sendable {
     case write(StrapCharacteristic, Data)
-    case authSucceeded, authRejected
+    case setNotify(StrapCharacteristic, enabled: Bool)
+    case authSucceeded, authRejected, authBusy
+    case preparationStepStarted
     case sessionPrepared(StrapDeviceSummary)
     case fetchProgressed(StrapFetchType)
     case fetchCompleted(StrapFetchType, [FetchedRound])
@@ -1197,37 +1269,66 @@ final class StrapSession {
 }
 ```
 
-Rules:
+Rules (API map rows 2–6):
 
-- **No I/O.** Writes are returned as `.write` outputs.
-- **`prepare`** sends four requests in this order: services list, set time (`now`, `timeZone`), device info, battery. It emits `.sessionPrepared` once all four replies have arrived.
-- **Fetching:**
-  - Every round is acked with ZeppKit's `.keepOnDevice` (`03 09`).
-  - `.fetchProgressed(type)` is emitted for every data notification of the active fetch.
-  - `.fetchCompleted(type, rounds)` is emitted when ZeppKit reports that no more rounds remain. Each round's `receivedAt` is the `now` of the fetch input.
+- **No I/O.** Writes and subscription changes are returned as outputs.
+- **Authenticate:**
+  1. Build `ZeppLink(authKey: key.zeppAuthKey, random: .system, maxWriteLength: maximumWriteLength)`.
+  2. Emit `.setNotify(.chunkedRead, enabled: true)`, plus `.setNotify(.chunkedWrite, enabled: true)` when `notifiable` contains `.chunkedWrite`.
+  3. Once every requested subscription is confirmed by `.notifyStateChanged(_, enabled: true)`, emit the writes of `link.startAuthentication()`.
+- **Link events:**
+  - Notifications on `.chunkedRead` and `.chunkedWrite` go to `link.receive`. Its writes are always emitted.
+  - `.authenticated`: emit `.setNotify(.chunkedWrite, enabled: false)` if it was subscribed, then `.authSucceeded`.
+  - `.authenticationFailed(.wrongAuthKey)`: emit `.authRejected`.
+  - Any other `.authenticationFailed`: emit `.authBusy`.
+  - `.message` on `ZeppEndpoint.connection` (`0x0015`):
+    - Payload `03` (ping): send `[0x04]` on `0x0015`.
+    - Payload `02 lo hi` with an announced length ≥ 20: call `link.setMaxWriteLength(min(announced, maximumWriteLength))`.
+  - Any other `.message` answers the current preparation step, if it matches that step's endpoint.
+- **Prepare:**
+  - The steps are services list, device info, battery, set time, in that order.
+  - Starting a step emits `.preparationStepStarted` and sends its request.
+  - The services-list reply is applied with `link.apply(servicesList:)`. Later steps whose endpoint is not in the list are skipped without starting. If there is no list, because that step was skipped, every later step is skipped.
+  - A matching reply, or `.skipPreparationStep`, ends the current step.
+  - After the last step, emit `.sessionPrepared(StrapDeviceSummary(batteryPercent: battery?.level, firmwareVersion: deviceInfo?.firmwareVersion))`. A `ZeppDeviceInfo` with `isAmbiguous` is ignored.
+- **Fetch:**
+  1. Emit `.setNotify(.activityControl, enabled: true)` and `.setNotify(.activityData, enabled: true)`.
+  2. Once both are confirmed, create `ZeppHistoryFetch(plan: [(zeppType, since)], now: now, configuration: .init(ackPolicy: .keepOnDevice, timeZone: timeZone))` and process `start()`.
+  3. `.activityControl` notifications go to `receiveControl`. `.activityData` notifications emit `.fetchProgressed(type)`, then go to `receiveData`.
+  4. Actions:
+     - `.sendControl(bytes)` becomes `.write(.activityControl, Data(bytes))`.
+     - `.roundReady(round)`: append `FetchedRound(fetchType: type, roundStart: round.start, payload: Data(round.rawData), receivedAt: now, nextSince: round.nextSince)`, then process `commit(roundID: round.id, durable: false)`. Under `.keepOnDevice` the ack is `03 09` either way.
+     - `.roundFailed` and `.noData` add nothing.
+     - `.finished`: emit `.setNotify(.activityControl, enabled: false)`, `.setNotify(.activityData, enabled: false)`, then `.fetchCompleted(type, rounds)`.
 - **Out-of-order input:** an input that does not fit the session's current step returns `[]`.
 - **Header:** the file starts with the adaptation header for `HelioSession.swift`.
 
 - [ ] **Step 1: Write the test helper**
 
-`FakeStrapDeviceLink.swift` wraps `FakeZeppDevice`, following API map row 10:
+`FakeStrapDeviceLink.swift` wraps `FakeZeppDevice` (API map row 10):
 
 ```swift
 final class FakeStrapDeviceLink {
-    init(deviceKey: StrapAuthKey, seeded fixtures: [DecoderFixture])
-    var batteryPercent: Int { get }
-    func receive(_ data: Data, on characteristic: StrapCharacteristic) -> [(StrapCharacteristic, Data)]
+    static let notifiable: Set<StrapCharacteristic> = [.chunkedRead, .chunkedWrite, .activityControl, .activityData]
+    let device: FakeZeppDevice
+    init(deviceKey: StrapAuthKey, seeded fixtures: [DecoderFixture], listsDeviceInfo: Bool = false)
 }
 
-func drive(_ session: StrapSession, _ device: FakeStrapDeviceLink, _ input: StrapSessionInput) -> [StrapSessionOutput]
+func drive(_ session: StrapSession, _ link: FakeStrapDeviceLink, _ input: StrapSessionInput) -> [StrapSessionOutput]
 ```
 
-`drive` loops until the session is quiet:
+The initializer:
 
-1. Pass every `.write` output to `device.receive`.
-2. Feed each returned notification back as `.notification`.
+- Creates `FakeZeppDevice(authKey: [UInt8](deviceKey.bytes), privateKey: Array(UInt8(0x81)...UInt8(0x98)), random: Array(UInt8(0xf0)...UInt8(0xff)), writeLength: 244)`.
+- Seeds `device.fetchData[zeppType] = (start: ZeppFetchTimestamp.encode(fixture.roundStart, timeZone: TimeZone(identifier: "UTC")!), data: fixture.payload)` for each fixture.
+- Removes `0x0043` from `device.services` unless `listsDeviceInfo` is true. The fake has no device-info reply by default, so a listed device-info step can only end by being skipped.
 
-It returns the non-write outputs, in order.
+`drive` hands `input` to the session, then works through the outputs first in, first out:
+
+- `.write(c, d)`: pass `ZeppWrite(c, [UInt8](d))` to `link.device.phoneWrote`, and feed every returned notification back as `.notification(n.characteristic, Data(n.bytes))`.
+- `.setNotify(c, e)`: feed back `.notifyStateChanged(c, enabled: e)`.
+
+It returns every output except `.write`, in order.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -1236,53 +1337,82 @@ struct StrapSessionTests {
     let deviceKey = StrapAuthKey.parse("00112233445566778899aabbccddeeff")!
     let otherKey = StrapAuthKey.parse("ffeeddccbbaa99887766554433221100")!
     let now = Date(timeIntervalSince1970: 1_791_355_320)
+    let berlin = TimeZone(identifier: "Europe/Berlin")!
     let activity = DecoderFixture.all.first { $0.fetchType == .activity }!
 
-    func prepared(_ device: FakeStrapDeviceLink) -> StrapSession {
+    func authenticate(_ session: StrapSession, _ link: FakeStrapDeviceLink, key: StrapAuthKey) -> [StrapSessionOutput] {
+        drive(session, link, .authenticate(key: key, maximumWriteLength: 244, notifiable: FakeStrapDeviceLink.notifiable))
+    }
+    func prepared(_ link: FakeStrapDeviceLink) -> StrapSession {
         let session = StrapSession()
-        _ = drive(session, device, .authenticate(key: deviceKey, maximumWriteLength: 244))
-        _ = drive(session, device, .prepare(now: now, timeZone: TimeZone(identifier: "Europe/Berlin")!))
+        _ = authenticate(session, link, key: deviceKey)
+        _ = drive(session, link, .prepare(now: now, timeZone: berlin))
         return session
     }
 
     @Test func authenticatesWithMatchingKey() {
-        let device = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [])
-        let outputs = drive(StrapSession(), device, .authenticate(key: deviceKey, maximumWriteLength: 244))
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [])
+        let outputs = authenticate(StrapSession(), link, key: deviceKey)
         #expect(outputs.contains(.authSucceeded))
-        #expect(!outputs.contains(.authRejected))
+        #expect(outputs.contains(.setNotify(.chunkedWrite, enabled: false)))
+        #expect(link.device.authenticated)
     }
     @Test func rejectsWrongKey() {
-        let device = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [])
-        let outputs = drive(StrapSession(), device, .authenticate(key: otherKey, maximumWriteLength: 244))
-        #expect(outputs.contains(.authRejected))
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [])
+        #expect(authenticate(StrapSession(), link, key: otherKey).contains(.authRejected))
     }
-    @Test func prepareReportsBattery() {
-        let device = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [])
+    @Test func secondPrepareIsIgnoredAndTimeWasSetOnce() {
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [])
+        let outputs = drive(prepared(link), link, .prepare(now: now, timeZone: berlin))
+        #expect(outputs.isEmpty)                                        // already prepared: out of order
+        #expect(link.device.timeSetCount == 1)
+    }
+    @Test func preparedSummaryCarriesBattery() {
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [])
         let session = StrapSession()
-        _ = drive(session, device, .authenticate(key: deviceKey, maximumWriteLength: 244))
-        let outputs = drive(session, device, .prepare(now: now, timeZone: TimeZone(identifier: "Europe/Berlin")!))
-        guard case .sessionPrepared(let summary)? = outputs.last else { Issue.record("not prepared"); return }
-        #expect(summary.batteryPercent == device.batteryPercent)
+        _ = authenticate(session, link, key: deviceKey)
+        let outputs = drive(session, link, .prepare(now: now, timeZone: berlin))
+        #expect(outputs.contains(.preparationStepStarted))
+        #expect(outputs.last == .sessionPrepared(StrapDeviceSummary(batteryPercent: 87, firmwareVersion: nil)))
     }
-    @Test func fetchActivityReturnsSeededRound() {
-        let device = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [activity])
-        let outputs = drive(prepared(device), device, .fetch(.activity, notBefore: activity.roundStart, now: now))
+    @Test func unansweredStepIsSkippedOnRequest() {
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [], listsDeviceInfo: true)
+        let session = StrapSession()
+        _ = authenticate(session, link, key: deviceKey)
+        let waiting = drive(session, link, .prepare(now: now, timeZone: berlin))
+        #expect(waiting.last == .preparationStepStarted)                // device info never answers
+        let resumed = drive(session, link, .skipPreparationStep)
+        #expect(resumed.last == .sessionPrepared(StrapDeviceSummary(batteryPercent: 87, firmwareVersion: nil)))
+    }
+    @Test func fetchActivityReturnsSeededRounds() {
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [activity])
+        let outputs = drive(prepared(link), link, .fetch(.activity, since: activity.roundStart, now: now, timeZone: berlin))
         #expect(outputs.contains(.fetchProgressed(.activity)))
+        #expect(outputs.contains(.setNotify(.activityData, enabled: false)))
         guard case .fetchCompleted(.activity, let rounds)? = outputs.last else { Issue.record("no completion"); return }
-        #expect(rounds.map(\.payload) == [Data(activity.payload)])
-        #expect(rounds.allSatisfy { $0.receivedAt == now })
+        #expect(!rounds.isEmpty)
+        #expect(rounds.allSatisfy { $0.payload == Data(activity.payload) && $0.receivedAt == now })
+        #expect(rounds.first?.nextSince == Date(timeIntervalSince1970: 1_790_632_980))   // last record + 1 min
     }
-    @Test func fetchKeepsDataOnStrap() {
-        let device = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [activity])
-        let session = prepared(device)
-        let first = drive(session, device, .fetch(.activity, notBefore: activity.roundStart, now: now))
-        let second = drive(session, device, .fetch(.activity, notBefore: activity.roundStart, now: now))
-        #expect(first.last == second.last)
+    @Test func fetchAcksAreAlwaysKeep() {
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [activity])
+        _ = drive(prepared(link), link, .fetch(.activity, since: activity.roundStart, now: now, timeZone: berlin))
+        #expect(!link.device.fetchAcks.isEmpty)
+        #expect(link.device.fetchAcks.allSatisfy { $0 == 0x09 })
     }
     @Test func fetchOfEmptyTypeCompletesWithNoRounds() {
-        let device = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [activity])
-        let outputs = drive(prepared(device), device, .fetch(.temperature, notBefore: activity.roundStart, now: now))
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [activity])
+        let outputs = drive(prepared(link), link, .fetch(.temperature, since: activity.roundStart, now: now, timeZone: berlin))
         #expect(outputs.last == .fetchCompleted(.temperature, []))
+    }
+    @Test func answersPing() {
+        let link = FakeStrapDeviceLink(deviceKey: deviceKey, seeded: [])
+        link.device.services.append((endpoint: 0x0015, flag: 0))
+        let session = prepared(link)
+        for notification in link.device.unsolicited(endpoint: 0x0015, [0x03]) {
+            _ = drive(session, link, .notification(notification.characteristic, Data(notification.bytes)))
+        }
+        #expect(link.device.receivedEndpoints.last == 0x0015)
     }
 }
 ```
@@ -1295,8 +1425,8 @@ Expected: compile failure.
 
 - [ ] **Step 4: Implement `StrapSession`**
 
-- Compose the ZeppKit types named in API map rows 2–6, using `.keepOnDevice`.
-- Keep the internal step as a private `enum`: `awaitingAuthentication`, `authenticating`, `authenticated`, `preparing(pendingReplies)`, `ready`, `fetching(StrapFetchType)`.
+- Compose `ZeppLink` and `ZeppHistoryFetch` exactly as the rules above describe.
+- Keep the internal step as a private `enum`: `idle`, `subscribingForAuthentication(pending: Set<StrapCharacteristic>)`, `authenticating`, `authenticated`, `preparing(PreparationStep)`, `ready`, `subscribingForFetch(StrapFetchType, pending: Set<StrapCharacteristic>)`, `fetching(StrapFetchType)`.
 
 - [ ] **Step 5: Run the tests and confirm they pass**
 
@@ -1331,14 +1461,16 @@ git commit -m "feat(oxygen): add pure StrapSession over ZeppKit, tested against 
 ```swift
 enum StrapConnectionEvent: Equatable, Sendable {
     case bluetoothPoweredOn, bluetoothPoweredOff, bluetoothUnauthorized
-    case strapDiscovered, strapBusyDetected
-    case connected(maximumWriteLength: Int)
+    case strapDiscovered
+    case connected(maximumWriteLength: Int, notifiable: Set<StrapCharacteristic>)
     case connectionFailed, linkLost
     case notification(StrapCharacteristic, Data)
+    case notifyStateChanged(StrapCharacteristic, enabled: Bool)
 }
 @MainActor protocol StrapConnecting: AnyObject {
     func startScan(); func stopScan(); func connect(); func disconnect()
     func write(_ data: Data, to characteristic: StrapCharacteristic)
+    func setNotify(_ characteristic: StrapCharacteristic, enabled: Bool)
 }
 @MainActor protocol SyncTimerScheduling: AnyObject {
     func schedule(_ timer: SyncTimer, afterSeconds seconds: Int)   // replaces a pending timer of the same kind
@@ -1374,19 +1506,24 @@ enum SyncRunnerInput: Equatable, Sendable {
 | Input | Effect |
 |---|---|
 | `.syncRequested`, `.authKeyEntered` | The `SyncEvent` of the same name |
-| `.connection(.connected(m))` | Store `m` as the maximum write length, create a fresh `StrapSession`, then send `.connected` |
-| Other non-notification connection events | The `SyncEvent` of the same name |
+| `.connection(.connected(m, notifiable))` | Store `m` and `notifiable`, create a fresh `StrapSession`, then send `.connected` |
 | `.connection(.notification(c, d))` | `session.handle(.notification(c, d))`, then process the outputs |
+| `.connection(.notifyStateChanged(c, e))` | `session.handle(.notifyStateChanged(c, enabled: e))`, then process the outputs |
+| Other connection events | The `SyncEvent` of the same name |
 | `.timerFired(.scan)` | `.scanTimedOut` |
+| `.timerFired(.session)` | `.authTimedOut` in `active(.authenticating)`; `.preparationStepTimedOut` in `active(.preparing)`; ignored otherwise |
+| `.timerFired(.fetch)` | `.fetchTimedOut(t)` in `active(.fetching(t))`; ignored otherwise |
 | `.timerFired(.retry)` | `.retryTimerFired` |
-| `.timerFired(.fetch)` | `.fetchTimedOut(t)` when the state is `active(.fetching(t))`; ignored otherwise |
 
 **Session output mapping:**
 
 | Output | Effect |
 |---|---|
 | `.write(c, d)` | `connection.write(d, to: c)` |
+| `.setNotify(c, e)` | `connection.setNotify(c, enabled: e)` |
 | `.authSucceeded`, `.authRejected` | The `SyncEvent` of the same name |
+| `.authBusy` | `.strapBusyDetected` |
+| `.preparationStepStarted` | `.preparationStepStarted` |
 | `.sessionPrepared(s)` | Set `deviceSummary = s`, then send `.sessionPrepared` |
 | `.fetchProgressed(t)` | `.fetchProgressed(t)` |
 | `.fetchCompleted(t, rounds)` | Hold `rounds` as the pending rounds for `t`, then send `.fetchCompleted(t)` |
@@ -1396,10 +1533,11 @@ enum SyncRunnerInput: Equatable, Sendable {
 | Effect | Execution |
 |---|---|
 | `startScan`, `stopScan`, `connect`, `disconnect` | The connection method of the same name |
-| `authenticate` | `keyStore.load()`. If it returns nil or throws, send `.authKeyMissing`. Otherwise call `session.handle(.authenticate(key:maximumWriteLength:))` |
+| `authenticate` | `keyStore.load()`. If it returns nil or throws, send `.authKeyMissing`. Otherwise call `session.handle(.authenticate(key:maximumWriteLength:notifiable:))` with the stored values |
 | `prepareSession` | `session.handle(.prepare(now: now(), timeZone: timeZone))` |
-| `fetch(t)` | `session.handle(.fetch(t, notBefore: WatermarkRule.fetchStart(watermark: try? store.watermark(for: t), now: now()), now: now()))` |
-| `persist(t)` | Run the four persist steps below |
+| `skipPreparationStep` | `session.handle(.skipPreparationStep)` |
+| `fetch(t)` | `session.handle(.fetch(t, since: WatermarkRule.fetchStart(watermark: try? store.watermark(for: t), now: now()), now: now(), timeZone: timeZone))` |
+| `persist(t)` | Run the three persist steps below |
 | `armTimer` / `cancelTimer` | The `timers` method |
 | `markKeyRejected` | `try? keyStore.markRejected()` |
 | `recordSyncCompleted` | `lastSync.save(now())` |
@@ -1407,9 +1545,8 @@ enum SyncRunnerInput: Equatable, Sendable {
 `persist(t)` runs these steps:
 
 1. Build `StoredRound` values from the pending rounds of `t`.
-2. Decode each round, skipping any that throw.
-3. Find `newest` with `WatermarkRule.newestRecordTimestamp`.
-4. Call `store.commit`, then send `.persistSucceeded(t)`. If the commit throws, send `.persistFailed(t)` instead. Clear the pending rounds either way.
+2. Fold the watermark: start from `try? store.watermark(for: t)`, then apply `WatermarkRule.advanced(previous:nextSince:now:)` with each pending round's `nextSince`, in order.
+3. Call `store.commit(rounds:type:watermark:)`, then send `.persistSucceeded(t)`. If the commit throws, send `.persistFailed(t)` instead. Clear the pending rounds either way.
 
 **Ordering:**
 
@@ -1420,16 +1557,19 @@ enum SyncRunnerInput: Equatable, Sendable {
 - [ ] **Step 1: Write the test doubles**
 
 - `FakeStrapConnection`:
-  - Has a `weak var runner: SyncRunner?` and a `device: FakeStrapDeviceLink`.
+  - Has a `weak var runner: SyncRunner?` and a `link: FakeStrapDeviceLink` (Task 9).
   - Records method names in `calls: [String]`.
   - `startScan` sends `.strapDiscovered`.
-  - `connect` sends `.connected(maximumWriteLength: 244)`.
-  - `write` relays the device's notifications to `runner.receive(.connection(.notification(...)))`.
+  - `connect` sends `.connected(maximumWriteLength: 244, notifiable: FakeStrapDeviceLink.notifiable)`.
+  - `setNotify(c, enabled:)` sends `.notifyStateChanged(c, enabled:)` back at once.
+  - `write` passes `ZeppWrite(c, [UInt8](data))` to `link.device.phoneWrote` and relays every notification as `runner.receive(.connection(.notification(n.characteristic, Data(n.bytes))))`.
   - `stopScan` and `disconnect` only record.
   - With `isSilent = true`, it records calls but sends nothing.
 - `RecordingTimerScheduler` records `scheduled: [(SyncTimer, Int)]` and `cancelled: [SyncTimer]`.
 - `InMemoryStrapKeyStore` implements `StrapKeyStoring` with stored properties.
 - `FailingRawStore(wrapping: RawStore, failingType: StrapFetchType)` throws from `commit` for `failingType` and forwards everything else.
+
+`FakeZeppDevice` serves its seeded data whatever the requested start, so no watermark seeding is needed (API map row 10).
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -1437,7 +1577,6 @@ enum SyncRunnerInput: Equatable, Sendable {
 @MainActor struct SyncRunnerTests {
     let key = StrapAuthKey.parse("00112233445566778899aabbccddeeff")!
     let now = Date(timeIntervalSince1970: 1_791_355_320)
-    let epoch = Date(timeIntervalSince1970: 0)
 
     struct Harness { let runner: SyncRunner; let connection: FakeStrapConnection; let store: RawStoring
                      let keyStore: InMemoryStrapKeyStore; let timers: RecordingTimerScheduler; let lastSync: LastSyncRecord }
@@ -1445,20 +1584,18 @@ enum SyncRunnerInput: Equatable, Sendable {
     func makeHarness(deviceKey: StrapAuthKey? = nil, storedKey: StrapAuthKey?, store: RawStoring? = nil,
                      initialState: SyncState = SyncState(phase: .idle, retryUsed: false), silent: Bool = false) throws -> Harness
     // Seeds the fake device with DecoderFixture.all, keyed with deviceKey ?? key.
-    // When `store` is nil, creates an in-memory RawStore and calls seedEpochWatermarks on it.
-    // Uses UserDefaults(suiteName: UUID().uuidString) and TransitionLogRecorder(file: nil).
-
-    func seedEpochWatermarks(_ store: RawStoring) throws
-    // Commits no rounds with newestRecordTimestamp `epoch` for every fetch type, so fixture dates fall inside the fetch window.
+    // When `store` is nil, creates an in-memory RawStore.
+    // Uses UserDefaults(suiteName: UUID().uuidString), TransitionLogRecorder(file: nil), now: { now } and TimeZone(identifier: "UTC")!.
 
     @Test func fullSyncReachesIdleAndCommitsEveryType() throws {
         let h = try makeHarness(storedKey: key)
         h.runner.receive(.syncRequested)
         #expect(h.runner.state == SyncState(phase: .idle, retryUsed: false))
-        for type in StrapFetchType.syncOrder { #expect(try h.store.watermark(for: type)! > epoch) }
+        for type in StrapFetchType.syncOrder { #expect(try h.store.watermark(for: type) != nil) }
         #expect(h.lastSync.load() == now)
         #expect(h.connection.calls.first == "startScan")
         #expect(h.connection.calls.last == "disconnect")
+        #expect(h.connection.link.device.fetchAcks.allSatisfy { $0 == 0x09 })
     }
     @Test func wrongKeyEndsInKeyRejected() throws {
         let h = try makeHarness(deviceKey: StrapAuthKey.parse("ffeeddccbbaa99887766554433221100")!, storedKey: key)
@@ -1471,13 +1608,18 @@ enum SyncRunnerInput: Equatable, Sendable {
         h.runner.receive(.syncRequested)
         #expect(h.runner.state.phase == .failed(.keyMissing))
     }
+    @Test func authTimeoutEndsInStrapBusy() throws {
+        let h = try makeHarness(storedKey: key, initialState: SyncState(phase: .active(.authenticating), retryUsed: false), silent: true)
+        h.runner.receive(.timerFired(.session))
+        #expect(h.runner.state.phase == .failed(.strapBusy))
+        #expect(h.connection.calls.last == "disconnect")
+    }
     @Test func persistFailureLeavesWatermarkUnchanged() throws {
         let inner = RawStore(container: try RawStore.makeContainer(inMemory: true))
-        try seedEpochWatermarks(inner)
         let h = try makeHarness(storedKey: key, store: FailingRawStore(wrapping: inner, failingType: .activity))
         h.runner.receive(.syncRequested)
         #expect(h.runner.state.phase == .failed(.persistFailed(.activity)))
-        #expect(try h.store.watermark(for: .activity) == epoch)
+        #expect(try h.store.watermark(for: .activity) == nil)
     }
     @Test func secondSyncAddsNoDuplicateRecords() throws {
         let h = try makeHarness(storedKey: key)
@@ -1499,7 +1641,7 @@ enum SyncRunnerInput: Equatable, Sendable {
         let h = try makeHarness(storedKey: key, initialState: SyncState(phase: .active(.fetching(.activity)), retryUsed: false), silent: true)
         h.runner.receive(.connection(.bluetoothPoweredOff))
         #expect(h.runner.state.phase == .failed(.bluetoothOff))
-        #expect(try h.store.watermark(for: .activity) == epoch)
+        #expect(try h.store.watermark(for: .activity) == nil)
     }
     @Test func transitionsAreLogged() throws {
         let h = try makeHarness(storedKey: key)
@@ -1729,7 +1871,8 @@ enum ExportBundleWriter {
         #expect(manifest["time_zone_identifier"] as? String == "Europe/Berlin")
     }
     @Test func timestampsAreUTCInAnyTimeZone() throws {
-        let round = StoredRound(fetched: FetchedRound(fetchType: .activity, roundStart: t0, payload: Data([0x01, 0x02, 0x03]), receivedAt: t0))
+        let round = StoredRound(fetched: FetchedRound(fetchType: .activity, roundStart: t0, payload: Data([0x01, 0x02, 0x03]),
+                                                      receivedAt: t0, nextSince: nil))
         let record = DecodedStrapRecord(fetchType: .activity, timestamp: t0,
                                         fields: StrapRecordDecoder.fieldNames(for: .activity).map { StrapRecordField(name: $0, value: "0") },
                                         receivedAt: t0)
@@ -1922,18 +2065,27 @@ No state restoration identifier is passed, because state restoration is out of s
 - **Central manager:**
   - `CBCentralManager(delegate: self, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: false])`.
   - `centralManagerDidUpdateState` yields `.bluetoothPoweredOn`, `.bluetoothPoweredOff` or `.bluetoothUnauthorized`.
-- **`startScan()`:**
+- **`startScan()`** (API map row 11):
   - When the central is not powered on, yield the matching state event and return.
-  - Otherwise, first try `retrievePeripherals(withIdentifiers:)` with the stored identifier.
-  - Then scan as API map row 11 describes, and detect "busy" the same way upstream does, yielding `.strapBusyDetected`.
-  - On a match, store the identifier and yield `.strapDiscovered`.
+  - When `retrievePeripherals(withIdentifiers:)` finds the stored identifier, adopt that peripheral and yield `.strapDiscovered` without scanning.
+  - Otherwise run an unfiltered scan, `scanForPeripherals(withServices: nil, options: nil)`. Accept the first peripheral whose `CBAdvertisementDataLocalNameKey` (or `peripheral.name`) passes `ZeppDeviceModel.match(advertisedName:) == .helioStrap`, store its identifier, and yield `.strapDiscovered`.
+  - "Strap busy" is not detected here; it comes from the session at auth.
 - **`connect()`:**
-  - Discover the service and characteristics from API map row 3, and enable notifications on the notify characteristics.
-  - Once every notification state is confirmed, yield `.connected(maximumWriteLength: peripheral.maximumWriteValueLength(for: <row 3 write type>))`.
+  - Call `central.connect(peripheral, options: nil)`.
+  - On `didConnect`, run `discoverServices(nil)`, then `discoverCharacteristics(nil, for:)` for each service.
+  - Map each discovered characteristic to the `ZeppCharacteristic` whose `uuidString` matches, comparing the full 128-bit form case-insensitively. Never touch `ZeppGATT.firmwareUpdateServiceUUID`.
+  - When every service has reported its characteristics, yield `.connected(maximumWriteLength: peripheral.maximumWriteValueLength(for: .withoutResponse), notifiable: <the mapped characteristics whose properties contain .notify or .indicate>)`.
+- **`setNotify(c, enabled:)`:**
+  - Calls `peripheral.setNotifyValue(enabled, for:)`.
+  - `didUpdateNotificationStateFor` yields `.notifyStateChanged(c, enabled: characteristic.isNotifying)`.
+- **`write(data, to:)`:**
+  - Use `.withoutResponse` when the characteristic's properties contain `.writeWithoutResponse`, otherwise `.withResponse`.
+  - Writes queue first in, first out. Without-response writes are sent only while `peripheral.canSendWriteWithoutResponse` is true, and the queue resumes in `peripheralIsReady(toSendWriteWithoutResponse:)`.
+  - A write to a characteristic the strap does not have is dropped.
 - **Disconnects:**
   - `didFailToConnect` yields `.connectionFailed`.
   - `didDisconnectPeripheral` yields `.linkLost`, unless `disconnect()` was called since the last connect. That case is tracked by the explicit `isDisconnectRequested` property.
-- **Notifications:** `didUpdateValueFor` yields `.notification(StrapCharacteristic(uuidString: characteristic.uuid.uuidString), value)`.
+- **Notifications:** `didUpdateValueFor` yields `.notification(<mapped characteristic>, value)`. Values from unmapped characteristics are ignored.
 
 `FoundationScreen` is a single `List`, with sections in this order:
 

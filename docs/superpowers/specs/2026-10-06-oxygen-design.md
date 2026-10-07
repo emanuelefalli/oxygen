@@ -2,7 +2,7 @@
 
 - Date: 2026-10-06
 - Owner: Emanuele Falli
-- Status: approved 2026-10-07; revision 2 on 2026-10-07 (see section 16)
+- Status: approved 2026-10-07; revision 3 on 2026-10-07 (see section 16)
 - Scope of this spec: the overall architecture of Oxygen, plus the detailed design of sub-project 1 (Foundation). Sub-projects 2 to 5 are outlined here and get their own specs.
 
 ## 1. Brief
@@ -303,14 +303,14 @@ Phone GPS routes for outdoor workouts.
 | `bluetoothOff` | Central state is powered off | Banner with a link to Settings. `bluetoothPoweredOn` returns the coordinator to `idle`. |
 | `bluetoothUnauthorized` | Bluetooth permission denied | Banner with a link to Settings. |
 | `strapNotFound` | No strap seen within 15 s of scanning | Try again on the next launch or foreground. |
-| `strapBusy` | Another app holds the connection, usually Zepp with Bluetooth still on | Show "Turn off Bluetooth for Zepp". Try again on the next launch or foreground. |
+| `strapBusy` | Auth fails for any reason other than a wrong key, or the strap does not answer auth within 10 s. This usually means another app holds the strap, typically Zepp with Bluetooth still on. | Show "Turn off Bluetooth for Zepp". Try again on the next launch or foreground. |
 | `keyRejected` | The strap answers auth with `10 05 25` | Stop. Ask for a new key. Do not retry automatically. |
 | `keyMissing` | No auth key is stored (first launch) | Show key entry. Do not scan. |
 | `linkLost(state)` | Disconnect during any active state | Retry once after 10 s, restarting at `scanning`. If the retry fails too, `failed`. |
 | `fetchTimeout(type)` | No data for that fetch type within 30 s | Retry once after 10 s, restarting at `scanning`. If the retry fails too, `failed`. |
 | `persistFailed` | Writing to the store failed | The watermark does not move, so the round is fetched again on the next sync. Report the error. |
 
-A retry restarts the whole sync. Each fetch starts at its type's watermark, so committed data is not fetched again. The one record that overlaps at the watermark is removed by de-duplication.
+A retry restarts the whole sync. Each fetch starts at its type's watermark, the minute after the last committed record, so committed data is not fetched again. De-duplication still guards against a strap that re-sends records.
 
 Oxygen only ever acks with `03 09` (keep on strap). It never sends `03 01`, so the strap never discards data because of Oxygen.
 
@@ -414,14 +414,19 @@ The `0x2c` statistics files are not fetched.
   any state → failed(reason)
   ```
 
-  `preparing` covers the read-only steps after auth plus the clock: services list, set time, device info and battery.
-- Events: `syncRequested`, `authKeyEntered`, `authKeyMissing`, `bluetoothPoweredOn`, `bluetoothPoweredOff`, `bluetoothUnauthorized`, `strapDiscovered`, `strapBusyDetected`, `scanTimedOut`, `connected`, `connectionFailed`, `authSucceeded`, `authRejected`, `sessionPrepared`, `fetchProgressed(type)`, `fetchCompleted(type)`, `fetchTimedOut(type)`, `linkLost`, `persistSucceeded(type)`, `persistFailed(type)`, `retryTimerFired`.
+  `preparing` covers the steps after auth, in upstream's order: services list, device info, battery, then set time. A step whose endpoint the strap does not list is skipped. A step with no reply within 5 s is also skipped, as upstream does.
+- Events: `syncRequested`, `authKeyEntered`, `authKeyMissing`, `bluetoothPoweredOn`, `bluetoothPoweredOff`, `bluetoothUnauthorized`, `strapDiscovered`, `strapBusyDetected`, `scanTimedOut`, `connected`, `connectionFailed`, `authSucceeded`, `authRejected`, `authTimedOut`, `preparationStepStarted`, `preparationStepTimedOut`, `sessionPrepared`, `fetchProgressed(type)`, `fetchCompleted(type)`, `fetchTimedOut(type)`, `linkLost`, `persistSucceeded(type)`, `persistFailed(type)`, `retryTimerFired`.
 - The coordinator is a pure function from (state, event) to (next state, effects). A separate `SyncRunner` executes the effects.
 - The exits from `failed(reason)` are listed in section 10.1.
 - Fetch types run one at a time, in ascending code order (section 12.1).
 - **`persisting(type)`:** one SwiftData save commits the type's new rounds and its new watermark. The watermark only moves when that save succeeds.
-- **Watermark:** the newest record timestamp decoded from the type's committed rounds. The next fetch starts at the watermark (inclusive). With no watermark yet, it starts at now minus 7 days.
-- **Timeouts:** scan 15 s; fetch 30 s without progress; retry delay 10 s. Only one retry per sync.
+- **Rounds:** ZeppKit's `ZeppHistoryFetch` waits for each round to be confirmed (`commit`) before it acks the round and asks for the next one. With keep-on-device the ack is `03 09` regardless, so `StrapSession` confirms each round at once and collects the type's rounds. Oxygen's watermark still moves only after its own save.
+- **Watermark** (upstream's rule, `HelioFetchPlan.advancedCursor`): after a committed round, the watermark becomes the round's last record + 1 minute. It never passes now and never moves backward.
+- **Fetch start** (upstream's constants from `HelioFetchPlan`):
+  - Start at the type's watermark, floored to the minute.
+  - With no watermark, or one more than 5 minutes in the future, start at now − 7 days.
+  - Never start more than 30 days back.
+- **Timeouts:** scan 15 s; auth 10 s (gives `strapBusy`); each preparation step 5 s (the step is skipped); fetch 30 s without progress; retry delay 10 s. Only one retry per sync.
 - **Where the strap code comes from:**
   - `StrapConnection` is adapted from upstream `HelioConnection`, `StrapSession` from `HelioSession`, and `StrapKeyStore` from `HelioKeyStore`.
   - Each is rewritten in Oxygen's style, and records the upstream source path and commit in a header comment.
@@ -534,3 +539,8 @@ Each sub-project gets its own spec, implementation plan and build cycle.
   - Added the `preparing` and `waitingForRetry` states, the `keyMissing` failure reason and the related events.
   - Background wake-up sync moves to sub-project 3.
   - The repository is a private copy, not a public fork.
+- **2026-10-07, revision 3.** Written after reading the upstream code (`docs/superpowers/notes/2026-10-07-upstream-api-map.md`).
+  - The watermark and fetch-start rules now follow upstream's `HelioFetchPlan`: last record + 1 minute, a 7-day first fetch, at most 30 days back, 5-minute future tolerance, minute precision.
+  - `strapBusy` is detected at auth: any failure other than a wrong key, or no auth reply within 10 s.
+  - Added an auth timeout (10 s) and a per-step preparation timeout (5 s, step skipped), with the events `authTimedOut`, `preparationStepStarted` and `preparationStepTimedOut`.
+  - `StrapSession` confirms each ZeppKit round at once (the ack stays `03 09`).
