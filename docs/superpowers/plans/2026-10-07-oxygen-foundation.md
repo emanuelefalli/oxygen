@@ -2067,7 +2067,8 @@ No state restoration identifier is passed, because state restoration is out of s
   - `centralManagerDidUpdateState` yields `.bluetoothPoweredOn`, `.bluetoothPoweredOff` or `.bluetoothUnauthorized`.
 - **`startScan()`** (API map row 11):
   - When the central is not powered on, yield the matching state event and return.
-  - When `retrievePeripherals(withIdentifiers:)` finds the stored identifier, adopt that peripheral and yield `.strapDiscovered` without scanning.
+  - When `retrieveConnectedPeripherals(withServices: [FEE0])` returns the strap already connected to the iPhone (the stored identifier first, otherwise a name match), adopt it and yield `.strapDiscovered` without scanning. This keeps `Strap busy` reachable while Zepp holds the link.
+  - A strap that is only remembered is found by scanning, because CoreBluetooth's `connect` never times out and the reducer has no connecting timer (owner ruling, 2026-10-08).
   - Otherwise run an unfiltered scan, `scanForPeripherals(withServices: nil, options: nil)`. Accept the first peripheral whose `CBAdvertisementDataLocalNameKey` (or `peripheral.name`) passes `ZeppDeviceModel.match(advertisedName:) == .helioStrap`, store its identifier, and yield `.strapDiscovered`.
   - "Strap busy" is not detected here; it comes from the session at auth.
 - **`connect()`:**
