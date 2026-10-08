@@ -11,10 +11,11 @@ import UserNotifications
     let profileExpiration: Date?
 
     init() throws {
+        let logURL = try Self.transitionLogURL()
         let container = try RawStore.makeContainer(inMemory: false)
         store = RawStore(container: container)
         keyStore = StrapKeyStore(service: StrapKeyStore.productionService)
-        let logRecorder = TransitionLogRecorder(file: TransitionLogFile(url: try Self.transitionLogURL()))
+        let logRecorder = TransitionLogRecorder(file: TransitionLogFile(url: logURL))
         let timerStream = AsyncStream.makeStream(of: SyncTimer.self)
         timerFires = timerStream.stream
         let timers = TaskSyncTimerScheduler(fired: timerStream.continuation)
